@@ -35,9 +35,10 @@ document.querySelectorAll('[data-copy]').forEach(button =>
   })
 );
 
-// JWT STAGING MEMBERSHIP REGISTRATION
+// JWT STAGING MEMBERSHIP REGISTRATION — Cloudflare Worker API
+// The Worker holds the bridge secret. Never put secrets in browser code.
 const JWT_REGISTRATION_ENDPOINT =
-  'https://script.google.com/macros/s/AKfycbzfL1gDjqgW0fsRa567AzuCJrBuJD321_6EDB2i-CqtPjcjzbqQG8lKAfRgAfup-tbXzA/exec';
+  'https://jwt-staging-registration-api.jaloothwelfaretrust.workers.dev/';
 
 const jwtForm = document.getElementById('membership-form');
 
@@ -49,13 +50,11 @@ if (jwtForm) {
   const verifyButton = document.getElementById('jwt-otp-confirm');
   const resendButton = document.getElementById('jwt-otp-resend');
   const status = document.getElementById('jwt-registration-status');
-  const frame = document.getElementById('jwt-registration-frame');
 
   let awaiting = false;
   let busy = false;
-  let pendingAction = '';
   let verifiedSnapshot = null;
-  let requestTimeout = null;
+  let registrationComplete = false;
 
   function message(text, error = false) {
     status.textContent = text;
@@ -66,22 +65,29 @@ if (jwtForm) {
   function dataSnapshot() {
     return JSON.stringify(
       Array.from(new FormData(jwtForm).entries())
-        .filter(([key]) =>
-          key !== 'otp' &&
-          key !== 'cf-turnstile-response'
-        )
+        .filter(([key]) => key !== 'otp' && key !== 'cf-turnstile-response')
     );
   }
 
   function unlockButtons() {
     busy = false;
-    submit.disabled = false;
-    verifyButton.disabled = false;
-    resendButton.disabled = false;
+    submit.disabled = registrationComplete;
+    verifyButton.disabled = registrationComplete;
+    resendButton.disabled = registrationComplete;
   }
 
-  function submitToService(action) {
-    if (busy) return;
+  function resetTurnstile() {
+    if (window.turnstile && typeof window.turnstile.reset === 'function') {
+      try {
+        window.turnstile.reset();
+      } catch (err) {
+        console.warn('Turnstile reset unavailable.');
+      }
+    }
+  }
+
+  async function submitToService(action) {
+    if (busy || registrationComplete) return;
     if (!jwtForm.reportValidity()) return;
 
     const phoneFull = document.getElementById('jwt-phone-full');
@@ -95,10 +101,7 @@ if (jwtForm) {
     const params = new URLSearchParams(new FormData(jwtForm));
     params.set('action', action);
 
-    if (
-      action === 'request' &&
-      !params.get('cf-turnstile-response')
-    ) {
+    if (action === 'request' && !params.get('cf-turnstile-response')) {
       message(
         'Complete the security check before requesting an email code.',
         true
@@ -116,8 +119,6 @@ if (jwtForm) {
     }
 
     busy = true;
-    pendingAction = action;
-
     submit.disabled = true;
     verifyButton.disabled = true;
     resendButton.disabled = true;
@@ -128,48 +129,115 @@ if (jwtForm) {
         : 'Verifying your code…'
     );
 
-    // Hidden iframe form submission avoids cross-origin fetch restrictions.
-    const temp = document.createElement('form');
-    temp.method = 'POST';
-    temp.action = JWT_REGISTRATION_ENDPOINT;
-    temp.target = frame.name;
-    temp.style.display = 'none';
-
-    for (const [key, value] of params) {
-      const input = document.createElement('input');
-      input.type = 'hidden';
-      input.name = key;
-      input.value = value;
-      temp.appendChild(input);
-    }
-
-    document.body.appendChild(temp);
-
-    requestTimeout = window.setTimeout(() => {
-      if (!busy) return;
-
-      unlockButtons();
-
-      message(
-        'No response from the registration service. ' +
-        'Please check your connection and try again. ' +
-        'If you entered an OTP, check with JWT before submitting again.',
-        true
-      );
-    }, 45000);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(
+      () => controller.abort(),
+      40000
+    );
 
     try {
-      temp.submit();
+      const response = await fetch(JWT_REGISTRATION_ENDPOINT, {
+        method: 'POST',
+        mode: 'cors',
+        headers: {
+          'Content-Type':
+            'application/x-www-form-urlencoded;charset=UTF-8'
+        },
+        body: params.toString(),
+        signal: controller.signal,
+        cache: 'no-store'
+      });
+
+      const payload = await response.json();
+
+      if (
+        !payload ||
+        payload.source !== 'jwt-membership-v1' ||
+        !['otp_sent', 'registered', 'error'].includes(payload.status)
+      ) {
+        throw new Error(
+          'Unexpected response from registration service.'
+        );
+      }
+
+      if (action === 'request') {
+        resetTurnstile();
+      }
+
+      if (
+        payload.status === 'otp_sent' &&
+        action === 'request'
+      ) {
+        awaiting = true;
+        verifiedSnapshot = dataSnapshot();
+        otpArea.hidden = false;
+
+        message(
+          'A verification code has been sent. ' +
+          'Check your email (including spam).'
+        );
+
+        otpInput.focus();
+
+      } else if (
+        payload.status === 'registered' &&
+        action === 'confirm' &&
+        /^JWT-[DVS]-2019-\d{4,}$/.test(
+          String(payload.membershipNumber || '')
+        )
+      ) {
+        awaiting = false;
+        registrationComplete = true;
+        otpArea.hidden = true;
+        jwtForm.reset();
+
+        document.getElementById('jwt-country')
+          .dispatchEvent(new Event('change'));
+
+        message(
+          'Registration successful. Your membership number is ' +
+          payload.membershipNumber + '.'
+        );
+
+      } else if (payload.status === 'error') {
+        message(
+          String(
+            payload.message ||
+            'Registration failed. Please try again.'
+          ),
+          true
+        );
+
+      } else {
+        throw new Error(
+          'Unexpected registration response. ' +
+          'Contact JWT before trying again.'
+        );
+      }
+
     } catch (err) {
-      window.clearTimeout(requestTimeout);
-      unlockButtons();
+      console.error(
+        'JWT registration request failed:',
+        err.name
+      );
+
+      if (action === 'request') {
+        resetTurnstile();
+      }
 
       message(
-        'Unable to contact the registration service.',
+        err.name === 'AbortError'
+          ? 'The registration request timed out. ' +
+            'Check your email before requesting another code.'
+          : 'Could not complete the registration request. ' +
+            'Check your connection. If you were verifying an OTP, ' +
+            'contact JWT before trying again.',
         true
       );
+
     } finally {
-      temp.remove();
+      window.clearTimeout(timeout);
+      unlockButtons();
     }
   }
 
@@ -178,7 +246,8 @@ if (jwtForm) {
 
     if (awaiting) {
       message(
-        'Enter the code sent to your email, then select Verify & Complete Registration.',
+        'Enter the code sent to your email, ' +
+        'then select Verify & Complete Registration.',
         true
       );
       return;
@@ -192,9 +261,11 @@ if (jwtForm) {
 
     if (verifiedSnapshot !== dataSnapshot()) {
       message(
-        'Your details changed. Request a new verification code.',
+        'Your details changed. ' +
+        'Request a new verification code.',
         true
       );
+
       otpArea.hidden = true;
       awaiting = false;
       return;
@@ -204,85 +275,10 @@ if (jwtForm) {
   });
 
   resendButton.addEventListener('click', () => {
-    awaiting = false;
+    if (busy || registrationComplete) return;
+
+    // Keep the verification panel open until a replacement code is sent.
     submitToService('request');
-  });
-
-  window.addEventListener('message', event => {
-    // Google Apps Script HTMLService may use nested Google-hosted frames.
-    // This staging listener accepts responses from googleusercontent.com.
-    // Production should also validate a server-echoed request identifier.
-    if (
-      !/^https:\/\/([a-z0-9-]+\.)?googleusercontent\.com$/.test(
-        event.origin
-      )
-    ) {
-      return;
-    }
-
-    const payload = event.data;
-
-    if (
-      !payload ||
-      payload.source !== 'jwt-membership-v1' ||
-      !['otp_sent', 'registered', 'error'].includes(payload.status) ||
-      !busy
-    ) {
-      return;
-    }
-
-    window.clearTimeout(requestTimeout);
-    unlockButtons();
-
-    if (pendingAction === 'request' && window.turnstile) {
-      try {
-        window.turnstile.reset();
-      } catch (err) {
-        console.warn('Turnstile reset unavailable.');
-      }
-    }
-
-    if (
-      payload.status === 'otp_sent' &&
-      pendingAction === 'request'
-    ) {
-      awaiting = true;
-      verifiedSnapshot = dataSnapshot();
-      otpArea.hidden = false;
-
-      message(
-        'A verification code has been sent. Check your email (including spam).'
-      );
-
-      otpInput.focus();
-
-    } else if (
-      payload.status === 'registered' &&
-      pendingAction === 'confirm' &&
-      /^JWT-[DVS]-2019-\d{4,}$/.test(
-        String(payload.membershipNumber || '')
-      )
-    ) {
-      awaiting = false;
-      otpArea.hidden = true;
-      jwtForm.reset();
-
-      document.getElementById('jwt-country')
-        .dispatchEvent(new Event('change'));
-
-      submit.disabled = true;
-
-      message(
-        'Registration successful. Your membership number is ' +
-        payload.membershipNumber + '.'
-      );
-
-    } else if (payload.status === 'error') {
-      message(
-        String(payload.message || 'Registration failed. Please try again.'),
-        true
-      );
-    }
   });
 
   notice.hidden = true;
